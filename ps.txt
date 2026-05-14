@@ -1,0 +1,74 @@
+Optimizing Delivery ETAs with
+Graph-Based Network Intelligence
+Background
+Delhivery is India's largest fully-integrated logistics provider, operating a vast network of facilities, inter-
+city routes, and last-mile delivery across every major state. At the core of its operations is a hub-and-
+spoke model: shipments travel from a source facility through one or more intermediate hubs before
+reaching the destination, each hop is a segment of a multi-leg journey.
+To estimate delivery times, Delhivery uses OSRM, a standard routing engine that assumes clean traffic and
+shortest paths. But real-world logistics is far messier: congestion, facility dwell time, seasonal volume
+spikes, and route-type constraints all cause actual delivery times to deviate significantly from predictions.
+The Challenge
+The strategic question: Delhivery's OSRM system underestimates actual delivery time on a significant
+fraction of routes. Can a graph-based model, one that treats the logistics network as a connected graph
+of facilities and corridors, not a collection of independent point-to-point estimates, produce more
+accurate ETAs and identify which corridors and hubs are systematically causing delays?
+When ETA is wrong, SLAs are missed and customers are unhappy
+Downstream capacity planning breaks down across the network
+There is currently no systematic way to identify which hubs and corridors are the biggest contributors to
+delays
+Route-type decisions (FTL vs Carting) are made without accounting for graph position or structural risk of a
+facility
+Your Mission
+As a data science team, your goal is to build a graph-based intelligence system for Delhivery's logistics
+network. You will model the entire network as a directed graph, facilities as nodes, corridors as edges, and
+use this structure to produce smarter ETA predictions, surface bottleneck hubs, and generate actionable
+recommendations for the Head of Network Operations.
+Your final output is not just a model, it is a consulting deliverable: a strategy memo that a real operations
+leader could act on.
+What we expect from you
+Technical rigor, Clean, reproducible code with clear documentation. Model choices should be
+justified, not just applied
+Analytical thinking, Go beyond running the model. Interpret what the graph metrics mean for real
+operations. Why is a particular hub a bottleneck? What would fixing it cost vs. save?
+Business communication, The strategy memo must be written for an operations leader, not a data
+scientist. No raw model outputs, translate findings into decisions
+Creativity, Suggest additional insights, visualizations, or analyses beyond the provided scope if you
+spot something interesting in the data
+machine learning | consulting
+Key Tasks and Deliverables
+1.Graph construction & data pipeline -Parse and merge raw trip segments into a directed weighted
+graph where edge weights capture the median actual-vs-OSRM delay ratio per corridor, stratified by
+route type and time of day. Code must be clean, reproducible, and model choices justified - not just
+applied.
+2.Bottleneck & corridor audit - Compute betweenness centrality, in/out-degree, and clustering
+coefficients to identify critical chokepoint hubs and chronically delayed corridors (actual time
+exceeds OSRM by >20%). Visualize and rank by SLA breach contribution.
+3.Graph-enhanced ETA prediction model - Build and benchmark a baseline regression (trip-level
+features) against a GraphSAGE/node2vec-enhanced model. The graph model must demonstrably
+outperform the baseline on MAE and on % of trips with predicted ETA within 15% of actual. The "graph
+advantage" must be measured, not claimed.
+4.FTL vs Carting decision framework - Build an ML-backed framework for route-type selection with the
+time-cost trade-off quantified for different corridor profiles, accounting for distance, time of day,
+and the source facility's graph position.
+5.Network Operations Strategy Memo - Written for an operations leader, not a data scientist. Name the
+top 5 bottleneck hubs with their estimated SLA breach contribution, recommend corridor-specific
+interventions (parallel route, facility upgrade, or route-type shift), and quantify the % reduction in late
+deliveries and revenue-at-risk recovered if the top 3 hubs are upgraded. No raw model outputs -
+translate findings into decisions.
+Expected Impact
+By the end of this project, your solution should help Delhivery's operations team:
+Make smarter ETA predictions that reduce the gap between promised and actual delivery time
+Identify and prioritize hub upgrades based on their structural risk and SLA breach contribution
+Reduce SLA breaches on chronic delay corridors through targeted interventions
+Improve route-type decisions with a data-backed FTL vs Carting framework
+Recover revenue at risk by quantifying and acting on the highest-impact bottlenecks
+What your final submission should include
+1.Well-documented code, data pipeline, graph construction, model training, and benchmarking
+2.Graph visualizations of the logistics network with bottleneck hubs and delay corridors highlighted
+3.Model performance comparison (baseline vs. graph-enhanced) on both MAE and the 15%-accuracy
+business metric
+4.FTL vs Carting decision framework with supporting analysis
+5.Network Operations Strategy Memo (1–2 pages) with the top 5 bottleneck hubs, corridor-specific
+interventions, and revenue impact estimates
+6.Optional: A live Streamlit dashboard showing the network with real-time delay risk score
