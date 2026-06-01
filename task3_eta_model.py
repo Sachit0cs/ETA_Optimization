@@ -12,6 +12,13 @@ import matplotlib.pyplot as plt
 
 from sklearn.metrics import mean_absolute_error
 from xgboost import XGBRegressor
+import pickle
+import networkx as nx
+from sklearn.decomposition import PCA
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from typing import Dict, List, Tuple
 
 
 # ---------------------------------------------------------------------------
@@ -22,6 +29,8 @@ DATA_PATH = "delivery_data.csv"
 NODE_METRICS_PATH = "outputs/node_metrics.csv"
 OUTPUT_DIR = "outputs"
 MODEL_DIR = "models"
+GRAPH_PICKLE = os.path.join(OUTPUT_DIR, "logistics_graph.pkl")
+EMBEDDINGS_PATH = os.path.join(OUTPUT_DIR, "node_emb_graphsage.csv")
 
 TARGET = "actual_time"
 WITHIN_PCT = 0.15         # business accuracy threshold: within 15% of actual
@@ -55,7 +64,10 @@ GRAPH_METRIC_COLS = [
     "dst_betweenness", "dst_in_degree", "dst_out_degree",
     "dst_avg_delay", "dst_bottleneck_score",
 ]
-GRAPH_FEATURES = BASELINE_FEATURES + GRAPH_METRIC_COLS
+EMB_DIM = 8
+SRC_EMB_COLS = [f"src_emb_{i}" for i in range(EMB_DIM)]
+DST_EMB_COLS = [f"dst_emb_{i}" for i in range(EMB_DIM)]
+GRAPH_FEATURES = BASELINE_FEATURES + GRAPH_METRIC_COLS + SRC_EMB_COLS + DST_EMB_COLS
 
 
 # ---------------------------------------------------------------------------
@@ -89,6 +101,130 @@ def merge_graph_features(df: pd.DataFrame, node_metrics: pd.DataFrame) -> pd.Dat
 
     missing = df[GRAPH_METRIC_COLS].isnull().any(axis=1).sum()
     print(f"  graph metrics merged | rows missing any hub metric: {missing:,} / {len(df):,}")
+    return df
+
+
+def load_graph(path: str = GRAPH_PICKLE):
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"{path} not found. Run build_graph.py first to produce the graph pickle.")
+    with open(path, "rb") as f:
+        G = pickle.load(f)
+    return G
+
+
+def compute_graphsage_embeddings(G: nx.DiGraph, node_metrics: pd.DataFrame, emb_dim: int = EMB_DIM) -> pd.DataFrame:
+    """Train a small GraphSAGE (PyTorch) model to produce node embeddings.
+
+    This implementation trains a 1-layer GraphSAGE that aggregates mean of
+    1-hop neighbors and learns embeddings by predicting the node's
+    `avg_incoming_delay_factor` (regression). The learned embeddings are the
+    penultimate-layer outputs and are saved to `EMBEDDINGS_PATH`.
+    """
+    feat_cols = ["betweenness", "in_degree", "out_degree", "avg_incoming_delay_factor", "bottleneck_score"]
+    nm = node_metrics.set_index("center")[feat_cols]
+
+    # Node ordering
+    nodes = list(G.nodes())
+    idx_map = {n: i for i, n in enumerate(nodes)}
+
+    # Feature matrix and target vector
+    X = np.vstack([nm.loc[n].values if n in nm.index else np.zeros(len(feat_cols), dtype=float) for n in nodes])
+    y = np.array([nm.loc[n]["avg_incoming_delay_factor"] if n in nm.index else 0.0 for n in nodes], dtype=float)
+
+    # Neighbor lists
+    nbrs: List[List[int]] = []
+    for n in nodes:
+        neigh = set(G.predecessors(n)) | set(G.successors(n))
+        nbrs.append([idx_map[nb] for nb in neigh if nb in idx_map])
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    X_t = torch.tensor(X, dtype=torch.float32, device=device)
+    y_t = torch.tensor(y, dtype=torch.float32, device=device).unsqueeze(1)
+
+    class GraphSAGE(nn.Module):
+        def __init__(self, in_dim: int, emb_dim: int):
+            super().__init__()
+            self.fc1 = nn.Linear(in_dim * 2, 128)
+            self.fc2 = nn.Linear(128, emb_dim)
+            self.reg = nn.Linear(emb_dim, 1)
+
+        def forward(self, x, neigh_mean):
+            h = torch.cat([x, neigh_mean], dim=1)
+            h = torch.relu(self.fc1(h))
+            emb = torch.relu(self.fc2(h))
+            out = self.reg(emb)
+            return emb, out
+
+    model = GraphSAGE(X.shape[1], emb_dim).to(device)
+    opt = optim.Adam(model.parameters(), lr=0.01)
+    loss_fn = nn.MSELoss()
+
+    # Training loop
+    epochs = 100
+    for ep in range(epochs):
+        model.train()
+        # build neighbor means each epoch (simple python loops)
+        neigh_means = []
+        for nbr_idx in nbrs:
+            if nbr_idx:
+                neigh_means.append(X_t[nbr_idx].mean(dim=0, keepdim=True))
+            else:
+                neigh_means.append(torch.zeros(1, X_t.size(1), device=device))
+        neigh_means_t = torch.cat(neigh_means, dim=0)
+
+        emb, preds = model(X_t, neigh_means_t)
+        loss = loss_fn(preds, y_t)
+
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+
+        if (ep + 1) % 25 == 0:
+            print(f"    [GraphSAGE] epoch {ep+1}/{epochs} loss={loss.item():.6f}")
+
+    # Compute final embeddings and save
+    model.eval()
+    with torch.no_grad():
+        neigh_means = []
+        for nbr_idx in nbrs:
+            if nbr_idx:
+                neigh_means.append(X_t[nbr_idx].mean(dim=0, keepdim=True))
+            else:
+                neigh_means.append(torch.zeros(1, X_t.size(1), device=device))
+        neigh_means_t = torch.cat(neigh_means, dim=0)
+        embeddings, _ = model(X_t, neigh_means_t)
+
+    emb_np = embeddings.cpu().numpy()
+    emb_df = pd.DataFrame(emb_np, columns=[f"emb_{i}" for i in range(emb_np.shape[1])])
+    emb_df["center"] = nodes
+    emb_df = emb_df[["center"] + [c for c in emb_df.columns if c != "center"]]
+    emb_df.to_csv(EMBEDDINGS_PATH, index=False)
+    print(f"  Trained GraphSAGE embeddings saved -> {EMBEDDINGS_PATH} (dim={emb_np.shape[1]})")
+    return emb_df
+
+
+def merge_embeddings(df: pd.DataFrame, emb_df: pd.DataFrame) -> pd.DataFrame:
+    """Attach src_ and dst_ embeddings (prefix emb columns) to trip rows."""
+    if emb_df is None or emb_df.empty:
+        return df
+
+    emb_cols = [c for c in emb_df.columns if c != "center"]
+    # merge source
+    df = df.merge(
+        emb_df.rename(columns={c: f"src_{c}" for c in emb_cols}),
+        left_on="source_center", right_on="center", how="left",
+    ).drop(columns="center")
+    # merge destination
+    df = df.merge(
+        emb_df.rename(columns={c: f"dst_{c}" for c in emb_cols}),
+        left_on="destination_center", right_on="center", how="left",
+    ).drop(columns="center")
+
+    # Report any missing embeddings
+    src_missing = df[[f"src_{c}" for c in emb_cols]].isnull().any(axis=1).sum()
+    dst_missing = df[[f"dst_{c}" for c in emb_cols]].isnull().any(axis=1).sum()
+    print(f"  src embeddings missing: {src_missing:,} | dst embeddings missing: {dst_missing:,}")
     return df
 
 
@@ -248,7 +384,26 @@ def main():
     else:
         print("Loading data...")
         df, node_metrics = load_data()
+        # Merge per-node graph metrics
         df = merge_graph_features(df, node_metrics)
+
+        # Ensure GraphSAGE-like embeddings exist (recompute when retraining or missing)
+        emb_df = None
+        if args.retrain or not os.path.exists(EMBEDDINGS_PATH):
+            print("  computing GraphSAGE-like embeddings...")
+            G = load_graph()
+            emb_df = compute_graphsage_embeddings(G, node_metrics, emb_dim=EMB_DIM)
+        else:
+            try:
+                emb_df = pd.read_csv(EMBEDDINGS_PATH)
+                print(f"  loaded existing embeddings -> {EMBEDDINGS_PATH}")
+            except Exception:
+                print("  failed to load embeddings file; recomputing...")
+                G = load_graph()
+                emb_df = compute_graphsage_embeddings(G, node_metrics, emb_dim=EMB_DIM)
+
+        # Merge embeddings into trip rows (src_/dst_ prefixed columns)
+        df = merge_embeddings(df, emb_df)
         df = engineer_features(df)
 
         print("\nSplitting train/test...")
@@ -259,7 +414,9 @@ def main():
         # prediction-time filling stays identical.
         graph_medians = train[GRAPH_METRIC_COLS].median().to_dict()
         baseline_fill = {f: 0 for f in BASELINE_FEATURES}
-        graph_fill = {**baseline_fill, **graph_medians}
+        # Embedding fill: zeros for missing embeddings
+        emb_fill = {c: 0.0 for c in (SRC_EMB_COLS + DST_EMB_COLS)}
+        graph_fill = {**baseline_fill, **graph_medians, **emb_fill}
 
         print("\nTraining / loading models...")
         baseline_art = get_model(
