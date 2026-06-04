@@ -1,5 +1,6 @@
 import argparse
 import os
+import time
 from datetime import datetime
 
 import joblib
@@ -12,13 +13,14 @@ import matplotlib.pyplot as plt
 
 from sklearn.metrics import mean_absolute_error
 from xgboost import XGBRegressor
-import pickle
-import networkx as nx
-from sklearn.decomposition import PCA
+import lightgbm as lgb
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from typing import Dict, List, Tuple
+import pickle
+from sklearn.decomposition import PCA
+
+from graphsage_eta_model import compute_graphsage_embeddings
 
 
 # ---------------------------------------------------------------------------
@@ -38,6 +40,10 @@ RANDOM_STATE = 42
 
 BASELINE_MODEL_PATH = os.path.join(MODEL_DIR, "baseline_eta_xgb.joblib")
 GRAPH_MODEL_PATH = os.path.join(MODEL_DIR, "graph_eta_xgb.joblib")
+GRAPHSAGE_MODEL_PATH = os.path.join(MODEL_DIR, "graphsage_eta_xgb.joblib")
+GRAPHSAGE_LGBM_MODEL_PATH = os.path.join(MODEL_DIR, "graphsage_eta_lgbm.joblib")
+GRAPHSAGE_MLP_MODEL_PATH = os.path.join(MODEL_DIR, "graphsage_eta_mlp.joblib")
+GRAPHSAGE_RESIDUAL_MODEL_PATH = os.path.join(MODEL_DIR, "graphsage_residual_xgb.joblib")
 COMPARISON_PATH = os.path.join(OUTPUT_DIR, "model_comparison.csv")
 IMPORTANCE_PLOT_PATH = "feature_importance.png"
 
@@ -68,6 +74,8 @@ EMB_DIM = 8
 SRC_EMB_COLS = [f"src_emb_{i}" for i in range(EMB_DIM)]
 DST_EMB_COLS = [f"dst_emb_{i}" for i in range(EMB_DIM)]
 GRAPH_FEATURES = BASELINE_FEATURES + GRAPH_METRIC_COLS + SRC_EMB_COLS + DST_EMB_COLS
+GRAPHSAGE_FEATURES = BASELINE_FEATURES + SRC_EMB_COLS + DST_EMB_COLS
+RESIDUAL_FEATURES = BASELINE_FEATURES + GRAPH_METRIC_COLS + SRC_EMB_COLS + DST_EMB_COLS
 
 
 # ---------------------------------------------------------------------------
@@ -110,98 +118,6 @@ def load_graph(path: str = GRAPH_PICKLE):
     with open(path, "rb") as f:
         G = pickle.load(f)
     return G
-
-
-def compute_graphsage_embeddings(G: nx.DiGraph, node_metrics: pd.DataFrame, emb_dim: int = EMB_DIM) -> pd.DataFrame:
-    """Train a small GraphSAGE (PyTorch) model to produce node embeddings.
-
-    This implementation trains a 1-layer GraphSAGE that aggregates mean of
-    1-hop neighbors and learns embeddings by predicting the node's
-    `avg_incoming_delay_factor` (regression). The learned embeddings are the
-    penultimate-layer outputs and are saved to `EMBEDDINGS_PATH`.
-    """
-    feat_cols = ["betweenness", "in_degree", "out_degree", "avg_incoming_delay_factor", "bottleneck_score"]
-    nm = node_metrics.set_index("center")[feat_cols]
-
-    # Node ordering
-    nodes = list(G.nodes())
-    idx_map = {n: i for i, n in enumerate(nodes)}
-
-    # Feature matrix and target vector
-    X = np.vstack([nm.loc[n].values if n in nm.index else np.zeros(len(feat_cols), dtype=float) for n in nodes])
-    y = np.array([nm.loc[n]["avg_incoming_delay_factor"] if n in nm.index else 0.0 for n in nodes], dtype=float)
-
-    # Neighbor lists
-    nbrs: List[List[int]] = []
-    for n in nodes:
-        neigh = set(G.predecessors(n)) | set(G.successors(n))
-        nbrs.append([idx_map[nb] for nb in neigh if nb in idx_map])
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    X_t = torch.tensor(X, dtype=torch.float32, device=device)
-    y_t = torch.tensor(y, dtype=torch.float32, device=device).unsqueeze(1)
-
-    class GraphSAGE(nn.Module):
-        def __init__(self, in_dim: int, emb_dim: int):
-            super().__init__()
-            self.fc1 = nn.Linear(in_dim * 2, 128)
-            self.fc2 = nn.Linear(128, emb_dim)
-            self.reg = nn.Linear(emb_dim, 1)
-
-        def forward(self, x, neigh_mean):
-            h = torch.cat([x, neigh_mean], dim=1)
-            h = torch.relu(self.fc1(h))
-            emb = torch.relu(self.fc2(h))
-            out = self.reg(emb)
-            return emb, out
-
-    model = GraphSAGE(X.shape[1], emb_dim).to(device)
-    opt = optim.Adam(model.parameters(), lr=0.01)
-    loss_fn = nn.MSELoss()
-
-    # Training loop
-    epochs = 100
-    for ep in range(epochs):
-        model.train()
-        # build neighbor means each epoch (simple python loops)
-        neigh_means = []
-        for nbr_idx in nbrs:
-            if nbr_idx:
-                neigh_means.append(X_t[nbr_idx].mean(dim=0, keepdim=True))
-            else:
-                neigh_means.append(torch.zeros(1, X_t.size(1), device=device))
-        neigh_means_t = torch.cat(neigh_means, dim=0)
-
-        emb, preds = model(X_t, neigh_means_t)
-        loss = loss_fn(preds, y_t)
-
-        opt.zero_grad()
-        loss.backward()
-        opt.step()
-
-        if (ep + 1) % 25 == 0:
-            print(f"    [GraphSAGE] epoch {ep+1}/{epochs} loss={loss.item():.6f}")
-
-    # Compute final embeddings and save
-    model.eval()
-    with torch.no_grad():
-        neigh_means = []
-        for nbr_idx in nbrs:
-            if nbr_idx:
-                neigh_means.append(X_t[nbr_idx].mean(dim=0, keepdim=True))
-            else:
-                neigh_means.append(torch.zeros(1, X_t.size(1), device=device))
-        neigh_means_t = torch.cat(neigh_means, dim=0)
-        embeddings, _ = model(X_t, neigh_means_t)
-
-    emb_np = embeddings.cpu().numpy()
-    emb_df = pd.DataFrame(emb_np, columns=[f"emb_{i}" for i in range(emb_np.shape[1])])
-    emb_df["center"] = nodes
-    emb_df = emb_df[["center"] + [c for c in emb_df.columns if c != "center"]]
-    emb_df.to_csv(EMBEDDINGS_PATH, index=False)
-    print(f"  Trained GraphSAGE embeddings saved -> {EMBEDDINGS_PATH} (dim={emb_np.shape[1]})")
-    return emb_df
 
 
 def merge_embeddings(df: pd.DataFrame, emb_df: pd.DataFrame) -> pd.DataFrame:
@@ -264,40 +180,125 @@ def evaluate(y_true, y_pred) -> dict:
     }
 
 
-def train_model(name, features, fill_values, train, test) -> dict:
-    """Fit one XGBoost regressor and bundle it with everything needed to reuse it."""
+class MLPRegressor(nn.Module):
+    def __init__(self, input_dim: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Linear(64, 1),
+        )
+
+    def forward(self, x):
+        return self.net(x).squeeze(1)
+
+
+def train_model(name, features, fill_values, train, test, model_kind: str = "xgb") -> dict:
+    """Fit one ETA regressor and bundle timing/quality metrics for comparison."""
     X_train = build_design_matrix(train, features, fill_values)
     X_test = build_design_matrix(test, features, fill_values)
-    y_train = train[TARGET]
-    y_test = test[TARGET]
+    use_residual = model_kind == "residual"
 
-    model = XGBRegressor(**XGB_PARAMS)
-    model.fit(X_train, y_train)
-    metrics = evaluate(y_test, model.predict(X_test))
+    if use_residual:
+        y_train = train[TARGET] - train["osrm_time"]
+        y_test = test[TARGET] - test["osrm_time"]
+    else:
+        y_train = train[TARGET]
+        y_test = test[TARGET]
+
+    if model_kind == "lgbm":
+        model = lgb.LGBMRegressor(
+            n_estimators=300,
+            learning_rate=0.05,
+            max_depth=-1,
+            random_state=RANDOM_STATE,
+            verbosity=-1,
+            objective="regression_l1",
+        )
+        train_start = time.perf_counter()
+        model.fit(X_train, y_train)
+        train_time = time.perf_counter() - train_start
+
+        infer_start = time.perf_counter()
+        y_pred = model.predict(X_test)
+        infer_time = time.perf_counter() - infer_start
+    elif model_kind == "mlp":
+        X_train_np = X_train.to_numpy(dtype=np.float32)
+        X_test_np = X_test.to_numpy(dtype=np.float32)
+        y_train_np = y_train.to_numpy(dtype=np.float32)
+        y_test_np = y_test.to_numpy(dtype=np.float32)
+
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model = MLPRegressor(X_train_np.shape[1]).to(device)
+        optimizer = optim.Adam(model.parameters(), lr=1e-3)
+        loss_fn = nn.MSELoss()
+
+        train_start = time.perf_counter()
+        model.train()
+        Xtr = torch.tensor(X_train_np, dtype=torch.float32, device=device)
+        ytr = torch.tensor(y_train_np, dtype=torch.float32, device=device)
+        for _ in range(40):
+            optimizer.zero_grad()
+            pred = model(Xtr)
+            loss = loss_fn(pred, ytr)
+            loss.backward()
+            optimizer.step()
+        train_time = time.perf_counter() - train_start
+
+        infer_start = time.perf_counter()
+        model.eval()
+        with torch.no_grad():
+            y_pred = model(torch.tensor(X_test_np, dtype=torch.float32, device=device)).cpu().numpy()
+        infer_time = time.perf_counter() - infer_start
+    else:
+        model = XGBRegressor(**XGB_PARAMS)
+        train_start = time.perf_counter()
+        model.fit(X_train, y_train)
+        train_time = time.perf_counter() - train_start
+
+        infer_start = time.perf_counter()
+        y_pred = model.predict(X_test)
+        infer_time = time.perf_counter() - infer_start
+
+    if use_residual:
+        y_pred = test["osrm_time"].to_numpy(dtype=float) + y_pred
+        y_true_for_metrics = test[TARGET].to_numpy(dtype=float)
+        metrics = evaluate(y_true_for_metrics, y_pred)
+    else:
+        metrics = evaluate(y_test, y_pred)
+
+    if model_kind == "mlp":
+        model = model.cpu()
 
     return {
         "name": name,
         "model": model,
+        "model_kind": model_kind,
         "features": features,
         "fill_values": fill_values,
         "target": TARGET,
         "within_pct": WITHIN_PCT,
         "xgb_params": XGB_PARAMS,
         "metrics": metrics,
+        "training_time_sec": float(train_time),
+        "inference_time_sec": float(infer_time),
+        "overall_accuracy_pct": float(metrics["within_15_pct"]),
         "n_train": int(len(train)),
         "n_test": int(len(test)),
         "trained_at": datetime.now().isoformat(timespec="seconds"),
     }
 
 
-def get_model(name, path, features, fill_values, train, test, retrain) -> dict:
+def get_model(name, path, features, fill_values, train, test, retrain, model_kind: str = "xgb") -> dict:
     """Load a cached model artifact if present, otherwise train and save it."""
     if os.path.exists(path) and not retrain:
         print(f"  [{name}] loading cached model -> {path}")
         return joblib.load(path)
 
     print(f"  [{name}] training...")
-    artifact = train_model(name, features, fill_values, train, test)
+    artifact = train_model(name, features, fill_values, train, test, model_kind=model_kind)
     joblib.dump(artifact, path)
     print(f"  [{name}] saved -> {path}  "
           f"(MAE {artifact['metrics']['mae']:.2f}, "
@@ -309,31 +310,44 @@ def get_model(name, path, features, fill_values, train, test, retrain) -> dict:
 # 3. Reporting
 # ---------------------------------------------------------------------------
 
-def report_comparison(baseline_art: dict, graph_art: dict) -> pd.DataFrame:
-    b, g = baseline_art["metrics"], graph_art["metrics"]
+def report_comparison(baseline_art: dict, graph_art: dict, graphsage_art: dict, graphsage_lgbm_art: dict, graphsage_mlp_art: dict, residual_art: dict) -> pd.DataFrame:
+    b, g, s, l, m, r = baseline_art["metrics"], graph_art["metrics"], graphsage_art["metrics"], graphsage_lgbm_art["metrics"], graphsage_mlp_art["metrics"], residual_art["metrics"]
     comparison = pd.DataFrame(
         [
-            {"model": "baseline", "n_features": len(baseline_art["features"]), **b},
-            {"model": "graph_enhanced", "n_features": len(graph_art["features"]), **g},
+            {"model": "baseline", "n_features": len(baseline_art["features"]), "training_time_sec": baseline_art["training_time_sec"], "inference_time_sec": baseline_art["inference_time_sec"], "overall_accuracy_pct": baseline_art["overall_accuracy_pct"], **b},
+            {"model": "graph_enhanced", "n_features": len(graph_art["features"]), "training_time_sec": graph_art["training_time_sec"], "inference_time_sec": graph_art["inference_time_sec"], "overall_accuracy_pct": graph_art["overall_accuracy_pct"], **g},
+            {"model": "graphsage_xgb", "n_features": len(graphsage_art["features"]), "training_time_sec": graphsage_art["training_time_sec"], "inference_time_sec": graphsage_art["inference_time_sec"], "overall_accuracy_pct": graphsage_art["overall_accuracy_pct"], **s},
+            {"model": "graphsage_lgbm", "n_features": len(graphsage_lgbm_art["features"]), "training_time_sec": graphsage_lgbm_art["training_time_sec"], "inference_time_sec": graphsage_lgbm_art["inference_time_sec"], "overall_accuracy_pct": graphsage_lgbm_art["overall_accuracy_pct"], **l},
+            {"model": "graphsage_mlp", "n_features": len(graphsage_mlp_art["features"]), "training_time_sec": graphsage_mlp_art["training_time_sec"], "inference_time_sec": graphsage_mlp_art["inference_time_sec"], "overall_accuracy_pct": graphsage_mlp_art["overall_accuracy_pct"], **m},
+            {"model": "graphsage_residual", "n_features": len(residual_art["features"]), "training_time_sec": residual_art["training_time_sec"], "inference_time_sec": residual_art["inference_time_sec"], "overall_accuracy_pct": residual_art["overall_accuracy_pct"], **r},
         ]
     )
 
-    mae_impr = (b["mae"] - g["mae"]) / b["mae"] * 100
-    within_impr = g["within_15_pct"] - b["within_15_pct"]
-    wins_both = (g["mae"] < b["mae"]) and (g["within_15_pct"] > b["within_15_pct"])
+    mae_impr_graph = (b["mae"] - g["mae"]) / b["mae"] * 100
+    mae_impr_sage = (b["mae"] - s["mae"]) / b["mae"] * 100
+    mae_impr_lgbm = (b["mae"] - l["mae"]) / b["mae"] * 100
+    mae_impr_mlp = (b["mae"] - m["mae"]) / b["mae"] * 100
+    mae_impr_residual = (b["mae"] - r["mae"]) / b["mae"] * 100
+    within_impr_graph = g["within_15_pct"] - b["within_15_pct"]
+    within_impr_sage = s["within_15_pct"] - b["within_15_pct"]
+    within_impr_lgbm = l["within_15_pct"] - b["within_15_pct"]
+    within_impr_mlp = m["within_15_pct"] - b["within_15_pct"]
+    within_impr_residual = r["within_15_pct"] - b["within_15_pct"]
 
-    print("\n" + "=" * 60)
+    best_name = min([("baseline", b["mae"]), ("graph_enhanced", g["mae"]), ("graphsage_xgb", s["mae"]), ("graphsage_lgbm", l["mae"]), ("graphsage_mlp", m["mae"]), ("graphsage_residual", r["mae"])], key=lambda x: x[1])[0]
+
+    print("\n" + "=" * 96)
     print("MODEL COMPARISON  (evaluated on held-out test set)")
-    print("=" * 60)
+    print("=" * 96)
     print(comparison.to_string(index=False))
-    print("-" * 60)
-    print(f"MAE improvement        : {mae_impr:+.1f}%  "
-          f"({b['mae']:.2f} -> {g['mae']:.2f} min)")
-    print(f"Within-15% improvement : {within_impr:+.1f} pts  "
-          f"({b['within_15_pct']:.1f}% -> {g['within_15_pct']:.1f}%)")
-    print(f"Graph advantage on BOTH metrics: "
-          f"{'YES - confirmed' if wins_both else 'NO'}")
-    print("=" * 60)
+    print("-" * 96)
+    print(f"Baseline -> graph_enhanced : MAE {mae_impr_graph:+.1f}% | within15 {within_impr_graph:+.1f} pts")
+    print(f"Baseline -> graphsage_xgb  : MAE {mae_impr_sage:+.1f}% | within15 {within_impr_sage:+.1f} pts")
+    print(f"Baseline -> graphsage_lgbm : MAE {mae_impr_lgbm:+.1f}% | within15 {within_impr_lgbm:+.1f} pts")
+    print(f"Baseline -> graphsage_mlp  : MAE {mae_impr_mlp:+.1f}% | within15 {within_impr_mlp:+.1f} pts")
+    print(f"Baseline -> graphsage_resid : MAE {mae_impr_residual:+.1f}% | within15 {within_impr_residual:+.1f} pts")
+    print(f"Best ETA model so far      : {best_name}")
+    print("=" * 96)
 
     comparison.to_csv(COMPARISON_PATH, index=False)
     print(f"Comparison saved -> {COMPARISON_PATH}")
@@ -356,6 +370,51 @@ def plot_feature_importance(graph_art: dict, path: str) -> None:
     print(f"Feature-importance plot saved -> {path}")
 
 
+def plot_graphsage_feature_importance(path: str = "outputs/graphsage_feature_importance.png") -> None:
+    """Create a multi-panel feature-importance plot for GraphSAGE-related ETA models."""
+    artifacts = {
+        "graphsage_xgb": joblib.load(GRAPHSAGE_MODEL_PATH),
+        "graphsage_lgbm": joblib.load(GRAPHSAGE_LGBM_MODEL_PATH),
+        "graphsage_mlp": joblib.load(GRAPHSAGE_MLP_MODEL_PATH),
+        "graphsage_residual": joblib.load(GRAPHSAGE_RESIDUAL_MODEL_PATH),
+    }
+
+    fig, axes = plt.subplots(2, 2, figsize=(16, 10))
+    axes = axes.ravel()
+
+    for ax, (name, artifact) in zip(axes, artifacts.items()):
+        features = artifact["features"]
+        model = artifact["model"]
+        fill_values = artifact.get("fill_values", {})
+
+        if hasattr(model, "feature_importances_"):
+            importances = np.asarray(model.feature_importances_, dtype=float)
+        else:
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            model = model.to(device)
+            model.eval()
+            x0 = torch.tensor([fill_values.get(f, 0.0) for f in features], dtype=torch.float32, device=device).unsqueeze(0)
+            x0.requires_grad_(True)
+            with torch.enable_grad():
+                y = model(x0)
+                grads = torch.autograd.grad(y.sum(), x0)[0]
+            importances = grads.abs().detach().cpu().numpy().reshape(-1)
+            model = model.cpu()
+
+        order = np.argsort(importances)[::-1][:10]
+        ax.barh([features[i] for i in order], importances[order], color="steelblue")
+        ax.invert_yaxis()
+        ax.set_title(f"{name} - top 10 feature importance")
+        ax.set_xlabel("Relative importance")
+
+    fig.suptitle("GraphSAGE-related ETA model feature importance", fontsize=14, fontweight="bold")
+    fig.tight_layout(rect=[0, 0, 1, 0.97])
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    print(f"GraphSAGE feature-importance plot saved -> {path}")
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -374,13 +433,23 @@ def main():
     os.makedirs(MODEL_DIR, exist_ok=True)
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    both_cached = os.path.exists(BASELINE_MODEL_PATH) and os.path.exists(GRAPH_MODEL_PATH)
+    both_cached = (
+        os.path.exists(BASELINE_MODEL_PATH)
+        and os.path.exists(GRAPH_MODEL_PATH)
+        and os.path.exists(GRAPHSAGE_MODEL_PATH)
+        and os.path.exists(GRAPHSAGE_LGBM_MODEL_PATH)
+        and os.path.exists(GRAPHSAGE_MLP_MODEL_PATH)
+    )
 
     if both_cached and not args.retrain:
         # Fast path: skip the 55 MB CSV load entirely and reuse saved models.
         print("Cached models found - loading (pass --retrain to rebuild).")
         baseline_art = joblib.load(BASELINE_MODEL_PATH)
         graph_art = joblib.load(GRAPH_MODEL_PATH)
+        graphsage_art = joblib.load(GRAPHSAGE_MODEL_PATH)
+        graphsage_lgbm_art = joblib.load(GRAPHSAGE_LGBM_MODEL_PATH)
+        graphsage_mlp_art = joblib.load(GRAPHSAGE_MLP_MODEL_PATH)
+        residual_art = joblib.load(GRAPHSAGE_RESIDUAL_MODEL_PATH)
     else:
         print("Loading data...")
         df, node_metrics = load_data()
@@ -427,9 +496,30 @@ def main():
             "graph_enhanced", GRAPH_MODEL_PATH,
             GRAPH_FEATURES, graph_fill, train, test, args.retrain,
         )
+        graphsage_art = get_model(
+            "graphsage_xgb", GRAPHSAGE_MODEL_PATH,
+            GRAPHSAGE_FEATURES, {**baseline_fill, **emb_fill}, train, test, args.retrain,
+            model_kind="xgb",
+        )
+        graphsage_lgbm_art = get_model(
+            "graphsage_lgbm", GRAPHSAGE_LGBM_MODEL_PATH,
+            GRAPHSAGE_FEATURES, {**baseline_fill, **emb_fill}, train, test, args.retrain,
+            model_kind="lgbm",
+        )
+        graphsage_mlp_art = get_model(
+            "graphsage_mlp", GRAPHSAGE_MLP_MODEL_PATH,
+            GRAPHSAGE_FEATURES, {**baseline_fill, **emb_fill}, train, test, args.retrain,
+            model_kind="mlp",
+        )
+        residual_art = get_model(
+            "graphsage_residual", GRAPHSAGE_RESIDUAL_MODEL_PATH,
+            RESIDUAL_FEATURES, graph_fill, train, test, args.retrain,
+            model_kind="residual",
+        )
 
-    report_comparison(baseline_art, graph_art)
+    report_comparison(baseline_art, graph_art, graphsage_art, graphsage_lgbm_art, graphsage_mlp_art, residual_art)
     plot_feature_importance(graph_art, IMPORTANCE_PLOT_PATH)
+    plot_graphsage_feature_importance()
 
     print("\nDone!\n")
     return baseline_art, graph_art
