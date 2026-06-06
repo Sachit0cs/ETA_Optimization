@@ -119,9 +119,9 @@ def plot_full_network(G, metrics, pos, save_path):
 def plot_bottleneck_hubs(G, metrics, pos, save_path, top_n: int = 10):
     fig, ax = plt.subplots(figsize=(20, 15))
 
-    bw_map   = dict(zip(metrics["center"], metrics["betweenness"]))
+    bs_map   = dict(zip(metrics["center"], metrics["bottleneck_score"]))
     top_hubs = set(metrics.nlargest(top_n, "bottleneck_score")["center"].tolist())
-    max_bw   = max(bw_map.values()) if bw_map else 1.0
+    max_bs   = max(bs_map.values()) if bs_map and max(bs_map.values()) > 0 else 1.0
 
     bg_nodes = [n for n in G.nodes() if n not in top_hubs]
     nx.draw_networkx_nodes(
@@ -129,7 +129,9 @@ def plot_bottleneck_hubs(G, metrics, pos, save_path, top_n: int = 10):
         node_color="#cccccc", node_size=60, ax=ax, alpha=0.4,
     )
 
-    hub_sizes = [800 + 4000 * bw_map.get(n, 0) / max_bw for n in top_hubs]
+    # Size hubs by the same metric they are ranked on (bottleneck_score), so the
+    # top-ranked hub renders largest in a plot titled "bottleneck hubs".
+    hub_sizes = [800 + 4000 * bs_map.get(n, 0) / max_bs for n in top_hubs]
     nx.draw_networkx_nodes(
         G, pos, nodelist=list(top_hubs),
         node_color="#d73027", node_size=hub_sizes, ax=ax, alpha=0.9,

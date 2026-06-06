@@ -18,7 +18,6 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import pickle
-from sklearn.decomposition import PCA
 
 from graphsage_eta_model import compute_graphsage_embeddings
 
@@ -91,6 +90,36 @@ def load_data() -> tuple[pd.DataFrame, pd.DataFrame]:
     df = pd.read_csv(DATA_PATH)
     node_metrics = pd.read_csv(NODE_METRICS_PATH)
     return df, node_metrics
+
+
+def aggregate_to_trips(df: pd.DataFrame) -> pd.DataFrame:
+    """Collapse segment/scan-level rows to ONE row per trip.
+
+    The raw data is segment-level: actual_time / osrm_time are cumulative within
+    each OD leg, so training and scoring on raw rows double-counts long trips and
+    makes the "% within 15%" metric per-row instead of per-trip as the brief
+    requires. We rebuild trip-level totals from the per-hop segment_* columns
+    (matching the LSTM pipeline): target = sum(segment_actual_time); the OSRM
+    features are the corresponding segment sums. Graph features are taken from the
+    trip's origin (first) and final destination (last) facility.
+    """
+    df = df.sort_values(["trip_uuid", "od_start_time"])
+    trips = (
+        df.groupby("trip_uuid", sort=False)
+        .agg(
+            actual_time=("segment_actual_time", "sum"),
+            osrm_time=("segment_osrm_time", "sum"),
+            osrm_distance=("segment_osrm_distance", "sum"),
+            source_center=("source_center", "first"),
+            destination_center=("destination_center", "last"),
+            route_type=("route_type", "first"),
+            trip_creation_time=("trip_creation_time", "first"),
+            data=("data", "first"),
+        )
+        .reset_index()
+    )
+    print(f"  aggregated {len(df):,} segment rows -> {len(trips):,} trips")
+    return trips
 
 
 def merge_graph_features(df: pd.DataFrame, node_metrics: pd.DataFrame) -> pd.DataFrame:
@@ -225,6 +254,8 @@ def train_model(name, features, fill_values, train, test, model_kind: str = "xgb
         y_pred = model.predict(X_test)
         infer_time = time.perf_counter() - infer_start
     elif model_kind == "mlp":
+        torch.manual_seed(RANDOM_STATE)  # deterministic weight init / training
+        np.random.seed(RANDOM_STATE)
         X_train_np = X_train.to_numpy(dtype=np.float32)
         X_test_np = X_test.to_numpy(dtype=np.float32)
         y_train_np = y_train.to_numpy(dtype=np.float32)
@@ -439,6 +470,7 @@ def main():
         and os.path.exists(GRAPHSAGE_MODEL_PATH)
         and os.path.exists(GRAPHSAGE_LGBM_MODEL_PATH)
         and os.path.exists(GRAPHSAGE_MLP_MODEL_PATH)
+        and os.path.exists(GRAPHSAGE_RESIDUAL_MODEL_PATH)
     )
 
     if both_cached and not args.retrain:
@@ -453,6 +485,8 @@ def main():
     else:
         print("Loading data...")
         df, node_metrics = load_data()
+        # Collapse segment-level rows to one row per trip (per-trip ETA target)
+        df = aggregate_to_trips(df)
         # Merge per-node graph metrics
         df = merge_graph_features(df, node_metrics)
 

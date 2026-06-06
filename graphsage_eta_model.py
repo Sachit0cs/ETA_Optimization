@@ -40,23 +40,36 @@ def compute_graphsage_embeddings(
     model_path: str = GRAPHSAGE_MODEL_PATH,
 ) -> pd.DataFrame:
     """Train a small GraphSAGE model and save its embeddings plus model artifact."""
+    # Reproducibility: seed before any random weight initialisation.
+    np.random.seed(42)
+    torch.manual_seed(42)
+
+    # Structural features only. The regression target (avg_incoming_delay_factor)
+    # and bottleneck_score (which is derived from it) are deliberately EXCLUDED
+    # from the inputs to avoid target leakage -- previously the encoder was asked
+    # to predict one of its own input features and trivially learned identity.
     feat_cols = [
         "betweenness",
         "in_degree",
         "out_degree",
-        "avg_incoming_delay_factor",
-        "bottleneck_score",
     ]
-    nm = node_metrics.set_index("center")[feat_cols]
+    target_col = "avg_incoming_delay_factor"
+    nm = node_metrics.set_index("center")
 
     nodes = list(G.nodes())
     idx_map = {n: i for i, n in enumerate(nodes)}
 
     X = np.vstack(
-        [nm.loc[n].values if n in nm.index else np.zeros(len(feat_cols), dtype=float) for n in nodes]
-    )
+        [nm.loc[n, feat_cols].values if n in nm.index else np.zeros(len(feat_cols), dtype=float) for n in nodes]
+    ).astype(float)
+    # Standardise features so large-magnitude columns (degree counts) don't
+    # dominate the mean-aggregation and the linear layers over betweenness (~[0,1]).
+    mu = X.mean(axis=0)
+    sigma = X.std(axis=0)
+    sigma[sigma == 0] = 1.0
+    X = (X - mu) / sigma
     y = np.array(
-        [nm.loc[n]["avg_incoming_delay_factor"] if n in nm.index else 0.0 for n in nodes],
+        [nm.loc[n, target_col] if n in nm.index else 0.0 for n in nodes],
         dtype=float,
     )
 
@@ -69,6 +82,15 @@ def compute_graphsage_embeddings(
     X_t = torch.tensor(X, dtype=torch.float32, device=device)
     y_t = torch.tensor(y, dtype=torch.float32, device=device).unsqueeze(1)
 
+    # Features are fixed, so neighbour means are constant across epochs -- compute once.
+    neigh_means = []
+    for nbr_idx in nbrs:
+        if nbr_idx:
+            neigh_means.append(X_t[nbr_idx].mean(dim=0, keepdim=True))
+        else:
+            neigh_means.append(torch.zeros(1, X_t.size(1), device=device))
+    neigh_means_t = torch.cat(neigh_means, dim=0)
+
     model = GraphSAGE(X.shape[1], emb_dim).to(device)
     optimizer = optim.Adam(model.parameters(), lr=0.01)
     loss_fn = nn.MSELoss()
@@ -76,14 +98,6 @@ def compute_graphsage_embeddings(
     epochs = 100
     for ep in range(epochs):
         model.train()
-        neigh_means = []
-        for nbr_idx in nbrs:
-            if nbr_idx:
-                neigh_means.append(X_t[nbr_idx].mean(dim=0, keepdim=True))
-            else:
-                neigh_means.append(torch.zeros(1, X_t.size(1), device=device))
-        neigh_means_t = torch.cat(neigh_means, dim=0)
-
         embeddings, preds = model(X_t, neigh_means_t)
         loss = loss_fn(preds, y_t)
 
@@ -96,13 +110,6 @@ def compute_graphsage_embeddings(
 
     model.eval()
     with torch.no_grad():
-        neigh_means = []
-        for nbr_idx in nbrs:
-            if nbr_idx:
-                neigh_means.append(X_t[nbr_idx].mean(dim=0, keepdim=True))
-            else:
-                neigh_means.append(torch.zeros(1, X_t.size(1), device=device))
-        neigh_means_t = torch.cat(neigh_means, dim=0)
         embeddings, _ = model(X_t, neigh_means_t)
 
     emb_np = embeddings.cpu().numpy()

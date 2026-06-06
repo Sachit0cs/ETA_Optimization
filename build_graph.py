@@ -38,6 +38,14 @@ DELAY_THRESHOLD = 1.2     # factor > this = chronically delayed
 def load_and_preprocess(path: str) -> pd.DataFrame:
     df = pd.read_csv(path)
 
+    # Leakage guard: build the graph and ALL edge/node aggregates from TRAINING
+    # trips only. Otherwise test-set delay information leaks into the graph
+    # features later used to predict the test set.
+    if "data" in df.columns:
+        n_before = len(df)
+        df = df[df["data"] == "training"].copy()
+        print(f"  filtered to training rows: {len(df):,} / {n_before:,}")
+
     for col in ["od_start_time", "od_end_time", "trip_creation_time"]:
         if col in df.columns:
             df[col] = pd.to_datetime(df[col], errors="coerce")
@@ -131,6 +139,8 @@ def build_graph(
     edge_rt_agg: pd.DataFrame,
     edge_stats: pd.DataFrame,
     df: pd.DataFrame,
+    rt_medians: dict,
+    global_median: float,
 ) -> nx.DiGraph:
     G = nx.DiGraph()
 
@@ -158,6 +168,16 @@ def build_graph(
         weighted_factor = float(
             np.average(grp["overall_median_factor"], weights=grp["total_trips"])
         )
+        # Sparse corridors have too few trips for a trustworthy median, so a single
+        # outlier trip (e.g. factor=50) would otherwise top the bottleneck ranking.
+        # Fall back to the trip-weighted route-type median instead.
+        if total_trips < SPARSE_THRESHOLD:
+            weighted_factor = float(
+                np.average(
+                    [rt_medians.get(rt, global_median) for rt in grp["route_type"]],
+                    weights=grp["total_trips"],
+                )
+            )
         median_dist = float(grp["median_osrm_dist"].median())
         pct_delayed = float(grp["pct_delayed"].mean())
 
@@ -186,6 +206,8 @@ def build_graph(
     # Attach time-of-day lookup table to each existing edge
     for _, row in edge_stats.iterrows():
         src, dst = row["source_center"], row["destination_center"]
+        if pd.isna(row["tod_bucket"]):
+            continue  # skip legs with an unparseable start time (phantom "nan" bucket)
         if G.has_edge(src, dst):
             key = (row["route_type"], str(row["tod_bucket"]))
             G[src][dst]["tod_lookup"][key] = {
@@ -203,7 +225,11 @@ def build_graph(
 
 def compute_graph_metrics(G: nx.DiGraph) -> pd.DataFrame:
     print("  betweenness centrality...")
-    betweenness = nx.betweenness_centrality(G, weight="weight", normalized=True)
+    # Topological betweenness (unweighted). NetworkX treats edge weight as a
+    # DISTANCE, so passing the delay factor would make high-delay corridors look
+    # "far" and be avoided by shortest paths -- inverting the meaning of a
+    # chokepoint. Delay severity is captured separately via avg_incoming_delay_factor.
+    betweenness = nx.betweenness_centrality(G, weight=None, normalized=True)
 
     in_degree   = dict(G.in_degree())
     out_degree  = dict(G.out_degree())
@@ -299,7 +325,7 @@ def main():
     edge_rt_agg.to_csv(f"{OUTPUT_DIR}/edge_rt_aggregated.csv", index=False)
 
     print("\nConstructing directed graph...")
-    G = build_graph(edge_rt_agg, edge_stats, df)
+    G = build_graph(edge_rt_agg, edge_stats, df, rt_medians, global_median)
     print(f"  Nodes: {G.number_of_nodes()} | Edges: {G.number_of_edges()}")
     sparse_count = sum(1 for _, _, d in G.edges(data=True) if d.get("is_sparse"))
     print(f"  Sparse corridors (<{SPARSE_THRESHOLD} trips): {sparse_count}")
@@ -325,7 +351,7 @@ def main():
         pickle.dump(G, f)
 
     # Human-readable summary
-    with open(f"{OUTPUT_DIR}/graph_summary.txt", "w") as f:
+    with open(f"{OUTPUT_DIR}/graph_summary.txt", "w", encoding="utf-8") as f:
         f.write("Graph Summary\n" + "=" * 50 + "\n")
         f.write(f"Nodes (facilities)          : {G.number_of_nodes()}\n")
         f.write(f"Edges (corridors)            : {G.number_of_edges()}\n")
