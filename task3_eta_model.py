@@ -36,6 +36,11 @@ EMBEDDINGS_PATH = os.path.join(OUTPUT_DIR, "node_emb_graphsage.csv")
 TARGET = "actual_time"
 WITHIN_PCT = 0.15         # business accuracy threshold: within 15% of actual
 RANDOM_STATE = 42
+# EDA finding: trip actual_time is heavily right-skewed (skew=3.37), so squared
+# error over-weights the long tail. Train direct-ETA models on log1p(actual_time)
+# and invert at prediction time. (The residual model is exempt -- it already
+# models actual-osrm.) See outputs/eda/hyperparameter_signals.csv.
+LOG_TARGET = True
 
 BASELINE_MODEL_PATH = os.path.join(MODEL_DIR, "baseline_eta_xgb.joblib")
 GRAPH_MODEL_PATH = os.path.join(MODEL_DIR, "graph_eta_xgb.joblib")
@@ -69,6 +74,9 @@ GRAPH_METRIC_COLS = [
     "dst_betweenness", "dst_in_degree", "dst_out_degree",
     "dst_avg_delay", "dst_bottleneck_score",
 ]
+# EDA flagged several near-constant GraphSAGE dims at EMB_DIM=8, but reducing to 4
+# was tested and HURT downstream (graphsage_xgb collapsed to the baseline -- the few
+# useful dims got dropped too), so we keep 8. See outputs/eda/hyperparameter_signals.csv.
 EMB_DIM = 8
 SRC_EMB_COLS = [f"src_emb_{i}" for i in range(EMB_DIM)]
 DST_EMB_COLS = [f"dst_emb_{i}" for i in range(EMB_DIM)]
@@ -229,13 +237,16 @@ def train_model(name, features, fill_values, train, test, model_kind: str = "xgb
     X_train = build_design_matrix(train, features, fill_values)
     X_test = build_design_matrix(test, features, fill_values)
     use_residual = model_kind == "residual"
+    # log1p target for direct-ETA tree models. The tiny MLP is exempt: log-space
+    # made its predictions unstable (post-expm1 blow-up), so it keeps the raw target.
+    use_log = LOG_TARGET and not use_residual and model_kind != "mlp"
 
     if use_residual:
         y_train = train[TARGET] - train["osrm_time"]
-        y_test = test[TARGET] - test["osrm_time"]
+    elif use_log:
+        y_train = np.log1p(train[TARGET])
     else:
         y_train = train[TARGET]
-        y_test = test[TARGET]
 
     if model_kind == "lgbm":
         model = lgb.LGBMRegressor(
@@ -258,8 +269,7 @@ def train_model(name, features, fill_values, train, test, model_kind: str = "xgb
         np.random.seed(RANDOM_STATE)
         X_train_np = X_train.to_numpy(dtype=np.float32)
         X_test_np = X_test.to_numpy(dtype=np.float32)
-        y_train_np = y_train.to_numpy(dtype=np.float32)
-        y_test_np = y_test.to_numpy(dtype=np.float32)
+        y_train_np = np.asarray(y_train, dtype=np.float32)
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         model = MLPRegressor(X_train_np.shape[1]).to(device)
@@ -293,12 +303,15 @@ def train_model(name, features, fill_values, train, test, model_kind: str = "xgb
         y_pred = model.predict(X_test)
         infer_time = time.perf_counter() - infer_start
 
+    y_pred = np.asarray(y_pred, dtype=float)
     if use_residual:
         y_pred = test["osrm_time"].to_numpy(dtype=float) + y_pred
-        y_true_for_metrics = test[TARGET].to_numpy(dtype=float)
-        metrics = evaluate(y_true_for_metrics, y_pred)
-    else:
-        metrics = evaluate(y_test, y_pred)
+    elif use_log:
+        # Clip in log space before inverting so a poorly-behaved learner (e.g. the
+        # MLP) can't produce an expm1 overflow. Bound at ~3x the max training trip.
+        hi = float(np.log1p(train[TARGET].max())) + 1.0
+        y_pred = np.expm1(np.clip(y_pred, 0.0, hi))  # back to minutes
+    metrics = evaluate(test[TARGET].to_numpy(dtype=float), y_pred)
 
     if model_kind == "mlp":
         model = model.cpu()
@@ -310,6 +323,7 @@ def train_model(name, features, fill_values, train, test, model_kind: str = "xgb
         "features": features,
         "fill_values": fill_values,
         "target": TARGET,
+        "target_transform": "log1p" if use_log else ("residual" if use_residual else "identity"),
         "within_pct": WITHIN_PCT,
         "xgb_params": XGB_PARAMS,
         "metrics": metrics,

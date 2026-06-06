@@ -1,0 +1,4 @@
+signal,value,note,suggested_action
+target_skew,3.37,actual_time is heavily right-skewed; squared-error loss over-weights the long tail.,Train models on log1p(actual_time) (or use an L1/Tweedie objective) and invert for scoring.
+sparse_share_lt5,42.1,42.1% of corridors have <5 trips; their raw medians are unreliable.,Keep SPARSE_THRESHOLD=5 with the route-type-median fallback (already applied).
+dead_embeddings,6.0,6/8 embedding dims are near-constant.,Reduce EMB_DIM (e.g. to 4) to cut noise features.

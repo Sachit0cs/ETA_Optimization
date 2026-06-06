@@ -12,7 +12,7 @@ import torch.optim as optim
 MODEL_DIR = "models"
 EMBEDDINGS_PATH = os.path.join("outputs", "node_emb_graphsage.csv")
 GRAPHSAGE_MODEL_PATH = os.path.join(MODEL_DIR, "graphsage_eta.pt")
-EMB_DIM = 8
+EMB_DIM = 8  # EDA flagged dead dims, but dim=4 tested worse downstream; see outputs/eda/
 
 
 class GraphSAGE(nn.Module):
