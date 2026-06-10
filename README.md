@@ -57,7 +57,9 @@ Other headline findings:
 +-- task4_route_choice.py        Task 4 -- FTL vs Carting decision framework
 +-- task5_hub_impact.py          Task 5 (data) -- per-hub SLA breach & revenue at risk
 +-- app.py                       Task 5 (deliverable) -- Streamlit operations console
-+-- run_app.bat                  One-click dashboard launcher (Windows)
++-- app_lite.py                  Same console, performance build (only the active page renders)
++-- run_app.bat                  One-click launcher for the full console (port 8501)
++-- run_app_lite.bat             One-click launcher for the lite console (port 8502)
 +-- .streamlit/config.toml       Dashboard theme
 +-- models/                      Trained model artifacts (joblib/pt bundles)
 +-- outputs/
@@ -103,17 +105,31 @@ models from `models/` and just re-report -- useful for fast verification.
 `node2vec_eta_model_fixed.py` can also be run standalone to regenerate only the
 node2vec embeddings.
 
-### 2. The operations console
+### 2. The operations console (two builds)
 
 ```bash
-python -m streamlit run app.py
+python -m streamlit run app_lite.py    # LITE build -- recommended day to day (http://localhost:8501, or 8502 via the .bat)
+python -m streamlit run app.py         # full build (http://localhost:8501)
 ```
 
-(or double-click `run_app.bat` on Windows). Use `python -m streamlit` rather than
-the bare `streamlit` command -- pip user-installs often don't put the `streamlit`
-executable on PATH. The app serves at http://localhost:8501.
+(or double-click `run_app_lite.bat` / `run_app.bat` on Windows -- the .bat files
+pin the lite build to port 8502 so both can run side by side). Use
+`python -m streamlit` rather than the bare `streamlit` command -- pip
+user-installs often don't put the `streamlit` executable on PATH.
 
-Five tabs:
+Both builds show the same five views computed from the same artifacts with the
+same formulas (verified identical to the digit). The difference is architecture --
+the lite build exists because the full one re-renders *everything* on *every*
+interaction:
+
+| | `app.py` (full) | `app_lite.py` (lite) |
+|---|---|---|
+| Page rendering | `st.tabs` -- all 5 tabs re-render on every interaction | `st.navigation` -- only the active page runs |
+| Slider moves | full-script rerun, decision rule recomputed twice | `@st.fragment` -- only that section reruns; results cached per parameter combo |
+| Startup imports | xgboost / sklearn / matplotlib load up front | lazy -- models load on first Route Advisor / Memo visit |
+| Interactive map | re-embedded on every rerun, physics never stops | opt-in; physics capped at 350 iterations, switched off once the layout settles, straight edges (halves the simulation bodies) |
+
+Five views:
 
 | Tab | What it does |
 |---|---|
@@ -123,9 +139,11 @@ Five tabs:
 | **Route Advisor** | The Task-4 framework with **tunable economics** (value-of-time Rs/min, tail-risk weight, bottleneck uplift, freight rates); per-dispatch trade-off scatter, distance-band shares, a single-dispatch simulator, and buttons to re-run the Task-4 pipeline (with optional retrain) |
 | **Strategy Memo** | The Task-5 memo that **rewrites itself** as you change the cost-per-breach, upgrade benchmark and ranking; hub interventions, chronic-corridor table, one-click download |
 
-The app never reads the 55 MB raw CSV -- it runs entirely off the precomputed
-artifacts, so it loads in seconds and every slider responds instantly (model
-predictions are cached; the sliders only re-price the decision rule).
+Neither console reads the 55 MB raw CSV -- both run entirely off the precomputed
+artifacts (model predictions are cached; the sliders only re-price the decision
+rule). If the console feels slow, use the lite build: it renders one page at a
+time, reruns only the section a slider belongs to, and defers the model bundle
+and the network map until they are actually asked for.
 
 ---
 

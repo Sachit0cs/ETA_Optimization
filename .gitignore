@@ -6,3 +6,6 @@ generate_explanation_pdf.py
 .claude/
 CODEBASE_REVIEW.md
 /TASK4_PLAN.md
+
+# Derived at runtime by app_lite.py (patched copy of the pyvis map)
+outputs/visualizations/06_interactive_network_lite.html
