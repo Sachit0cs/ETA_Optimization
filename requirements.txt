@@ -1,0 +1,13 @@
+pandas
+numpy
+networkx
+xgboost
+lightgbm
+torch
+gensim
+scikit-learn
+matplotlib
+pyvis
+joblib
+streamlit
+plotly

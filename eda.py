@@ -385,7 +385,7 @@ def s_node2vec(ctx: E.EDAContext) -> None:
         return  # silently skip until node2vec embeddings exist
     ctx.heading("12. Node Embeddings (node2vec)")
     emb = pd.read_csv(path)
-    emb_cols = [c for c in emb.columns if c.startswith("emb_")]
+    emb_cols = [c for c in emb.columns if c.startswith("n2v_")]
     ctx.add_table(E.numeric_summary(emb, emb_cols), "node2vec embedding summary")
     ctx.add_finding("node2vec embeddings present; compare downstream lift vs GraphSAGE in task3.")
 
@@ -397,8 +397,15 @@ def s_task4(ctx: E.EDAContext) -> None:
         return  # enable when the Task-4 framework writes its feature table
     ctx.heading("13. FTL vs Carting -- Route-Choice Features (Task 4)")
     df = pd.read_csv(path)
-    ctx.add_table(E.numeric_summary(df, [c for c in df.columns if df[c].dtype != object]),
-                  "Route-choice feature summary")
+    # select_dtypes(number) also drops the bool decision flags (switch /
+    # extrapolated), which numeric_summary's quantiles can't handle.
+    num_cols = df.select_dtypes(include="number").columns.tolist()
+    ctx.add_table(E.numeric_summary(df, num_cols), "Route-choice feature summary")
+    if "recommended_route" in df.columns:
+        share = (df["recommended_route"] == "FTL").mean() * 100
+        sw = df["switch"].mean() * 100 if "switch" in df.columns else float("nan")
+        ctx.add_finding(f"Task-4 recommender: FTL recommended on {share:.1f}% of test "
+                        f"dispatches; {sw:.1f}% are switches vs the current route type.")
 
 
 @section("task5_hub_impact", "Hub SLA-breach / revenue-impact EDA (Task 5)", order=130)
@@ -408,8 +415,12 @@ def s_task5(ctx: E.EDAContext) -> None:
         return  # enable when the Task-5 strategy-memo pipeline writes hub impact
     ctx.heading("14. Hub SLA-Breach & Revenue Impact (Task 5)")
     df = pd.read_csv(path)
-    ctx.add_table(E.numeric_summary(df, [c for c in df.columns if df[c].dtype != object]),
-                  "Hub-impact feature summary")
+    num_cols = df.select_dtypes(include="number").columns.tolist()
+    ctx.add_table(E.numeric_summary(df, num_cols), "Hub-impact feature summary")
+    if {"breaches", "legs_out"}.issubset(df.columns):
+        rate = df["breaches"].sum() / df["legs_out"].sum() * 100
+        ctx.add_finding(f"Network SLA breach rate vs calibrated promise: {rate:.1f}% "
+                        f"({df['breaches'].sum():,.0f} breached dispatches).")
 
 
 # ===========================================================================

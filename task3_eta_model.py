@@ -20,6 +20,7 @@ import torch.optim as optim
 import pickle
 
 from graphsage_eta_model import compute_graphsage_embeddings
+from node2vec_eta_model_fixed import compute_node2vec_embeddings, N2V_DIM
 
 
 # ---------------------------------------------------------------------------
@@ -32,6 +33,7 @@ OUTPUT_DIR = "outputs"
 MODEL_DIR = "models"
 GRAPH_PICKLE = os.path.join(OUTPUT_DIR, "logistics_graph.pkl")
 EMBEDDINGS_PATH = os.path.join(OUTPUT_DIR, "node_emb_graphsage.csv")
+N2V_EMBEDDINGS_PATH = os.path.join(OUTPUT_DIR, "node_emb_node2vec.csv")
 
 TARGET = "actual_time"
 WITHIN_PCT = 0.15         # business accuracy threshold: within 15% of actual
@@ -48,6 +50,8 @@ GRAPHSAGE_MODEL_PATH = os.path.join(MODEL_DIR, "graphsage_eta_xgb.joblib")
 GRAPHSAGE_LGBM_MODEL_PATH = os.path.join(MODEL_DIR, "graphsage_eta_lgbm.joblib")
 GRAPHSAGE_MLP_MODEL_PATH = os.path.join(MODEL_DIR, "graphsage_eta_mlp.joblib")
 GRAPHSAGE_RESIDUAL_MODEL_PATH = os.path.join(MODEL_DIR, "graphsage_residual_xgb.joblib")
+NODE2VEC_MODEL_PATH = os.path.join(MODEL_DIR, "node2vec_eta_xgb.joblib")
+NODE2VEC_ENHANCED_MODEL_PATH = os.path.join(MODEL_DIR, "node2vec_enhanced_eta_xgb.joblib")
 COMPARISON_PATH = os.path.join(OUTPUT_DIR, "model_comparison.csv")
 IMPORTANCE_PLOT_PATH = "feature_importance.png"
 
@@ -83,6 +87,15 @@ DST_EMB_COLS = [f"dst_emb_{i}" for i in range(EMB_DIM)]
 GRAPH_FEATURES = BASELINE_FEATURES + GRAPH_METRIC_COLS + SRC_EMB_COLS + DST_EMB_COLS
 GRAPHSAGE_FEATURES = BASELINE_FEATURES + SRC_EMB_COLS + DST_EMB_COLS
 RESIDUAL_FEATURES = BASELINE_FEATURES + GRAPH_METRIC_COLS + SRC_EMB_COLS + DST_EMB_COLS
+# node2vec embeddings (computed from the SAME training-only graph pickle by
+# node2vec_eta_model_fixed.compute_node2vec_embeddings). The two node2vec models
+# mirror the GraphSAGE pair so the embedding methods compare like-for-like:
+#   node2vec_xgb      <-> graphsage_xgb   (baseline + embeddings only)
+#   node2vec_enhanced <-> graph_enhanced  (baseline + hub metrics + embeddings)
+SRC_N2V_COLS = [f"src_n2v_{i}" for i in range(N2V_DIM)]
+DST_N2V_COLS = [f"dst_n2v_{i}" for i in range(N2V_DIM)]
+NODE2VEC_FEATURES = BASELINE_FEATURES + SRC_N2V_COLS + DST_N2V_COLS
+NODE2VEC_ENHANCED_FEATURES = BASELINE_FEATURES + GRAPH_METRIC_COLS + SRC_N2V_COLS + DST_N2V_COLS
 
 
 # ---------------------------------------------------------------------------
@@ -355,42 +368,37 @@ def get_model(name, path, features, fill_values, train, test, retrain, model_kin
 # 3. Reporting
 # ---------------------------------------------------------------------------
 
-def report_comparison(baseline_art: dict, graph_art: dict, graphsage_art: dict, graphsage_lgbm_art: dict, graphsage_mlp_art: dict, residual_art: dict) -> pd.DataFrame:
-    b, g, s, l, m, r = baseline_art["metrics"], graph_art["metrics"], graphsage_art["metrics"], graphsage_lgbm_art["metrics"], graphsage_mlp_art["metrics"], residual_art["metrics"]
+def report_comparison(artifacts: list) -> pd.DataFrame:
+    """Single source of truth for benchmark results. The first artifact must be
+    the baseline; every model is evaluated with the same evaluate() on the same
+    trip-level test split, so the rows are directly comparable."""
     comparison = pd.DataFrame(
         [
-            {"model": "baseline", "n_features": len(baseline_art["features"]), "training_time_sec": baseline_art["training_time_sec"], "inference_time_sec": baseline_art["inference_time_sec"], "overall_accuracy_pct": baseline_art["overall_accuracy_pct"], **b},
-            {"model": "graph_enhanced", "n_features": len(graph_art["features"]), "training_time_sec": graph_art["training_time_sec"], "inference_time_sec": graph_art["inference_time_sec"], "overall_accuracy_pct": graph_art["overall_accuracy_pct"], **g},
-            {"model": "graphsage_xgb", "n_features": len(graphsage_art["features"]), "training_time_sec": graphsage_art["training_time_sec"], "inference_time_sec": graphsage_art["inference_time_sec"], "overall_accuracy_pct": graphsage_art["overall_accuracy_pct"], **s},
-            {"model": "graphsage_lgbm", "n_features": len(graphsage_lgbm_art["features"]), "training_time_sec": graphsage_lgbm_art["training_time_sec"], "inference_time_sec": graphsage_lgbm_art["inference_time_sec"], "overall_accuracy_pct": graphsage_lgbm_art["overall_accuracy_pct"], **l},
-            {"model": "graphsage_mlp", "n_features": len(graphsage_mlp_art["features"]), "training_time_sec": graphsage_mlp_art["training_time_sec"], "inference_time_sec": graphsage_mlp_art["inference_time_sec"], "overall_accuracy_pct": graphsage_mlp_art["overall_accuracy_pct"], **m},
-            {"model": "graphsage_residual", "n_features": len(residual_art["features"]), "training_time_sec": residual_art["training_time_sec"], "inference_time_sec": residual_art["inference_time_sec"], "overall_accuracy_pct": residual_art["overall_accuracy_pct"], **r},
+            {
+                "model": art["name"],
+                "n_features": len(art["features"]),
+                "training_time_sec": art["training_time_sec"],
+                "inference_time_sec": art["inference_time_sec"],
+                "overall_accuracy_pct": art["overall_accuracy_pct"],
+                **art["metrics"],
+            }
+            for art in artifacts
         ]
     )
 
-    mae_impr_graph = (b["mae"] - g["mae"]) / b["mae"] * 100
-    mae_impr_sage = (b["mae"] - s["mae"]) / b["mae"] * 100
-    mae_impr_lgbm = (b["mae"] - l["mae"]) / b["mae"] * 100
-    mae_impr_mlp = (b["mae"] - m["mae"]) / b["mae"] * 100
-    mae_impr_residual = (b["mae"] - r["mae"]) / b["mae"] * 100
-    within_impr_graph = g["within_15_pct"] - b["within_15_pct"]
-    within_impr_sage = s["within_15_pct"] - b["within_15_pct"]
-    within_impr_lgbm = l["within_15_pct"] - b["within_15_pct"]
-    within_impr_mlp = m["within_15_pct"] - b["within_15_pct"]
-    within_impr_residual = r["within_15_pct"] - b["within_15_pct"]
-
-    best_name = min([("baseline", b["mae"]), ("graph_enhanced", g["mae"]), ("graphsage_xgb", s["mae"]), ("graphsage_lgbm", l["mae"]), ("graphsage_mlp", m["mae"]), ("graphsage_residual", r["mae"])], key=lambda x: x[1])[0]
+    b = artifacts[0]["metrics"]
+    best_name = min(artifacts, key=lambda a: a["metrics"]["mae"])["name"]
 
     print("\n" + "=" * 96)
     print("MODEL COMPARISON  (evaluated on held-out test set)")
     print("=" * 96)
     print(comparison.to_string(index=False))
     print("-" * 96)
-    print(f"Baseline -> graph_enhanced : MAE {mae_impr_graph:+.1f}% | within15 {within_impr_graph:+.1f} pts")
-    print(f"Baseline -> graphsage_xgb  : MAE {mae_impr_sage:+.1f}% | within15 {within_impr_sage:+.1f} pts")
-    print(f"Baseline -> graphsage_lgbm : MAE {mae_impr_lgbm:+.1f}% | within15 {within_impr_lgbm:+.1f} pts")
-    print(f"Baseline -> graphsage_mlp  : MAE {mae_impr_mlp:+.1f}% | within15 {within_impr_mlp:+.1f} pts")
-    print(f"Baseline -> graphsage_resid : MAE {mae_impr_residual:+.1f}% | within15 {within_impr_residual:+.1f} pts")
+    for art in artifacts[1:]:
+        m = art["metrics"]
+        mae_impr = (b["mae"] - m["mae"]) / b["mae"] * 100
+        within_impr = m["within_15_pct"] - b["within_15_pct"]
+        print(f"Baseline -> {art['name']:<18} : MAE {mae_impr:+.1f}% | within15 {within_impr:+.1f} pts")
     print(f"Best ETA model so far      : {best_name}")
     print("=" * 96)
 
@@ -478,24 +486,22 @@ def main():
     os.makedirs(MODEL_DIR, exist_ok=True)
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    both_cached = (
-        os.path.exists(BASELINE_MODEL_PATH)
-        and os.path.exists(GRAPH_MODEL_PATH)
-        and os.path.exists(GRAPHSAGE_MODEL_PATH)
-        and os.path.exists(GRAPHSAGE_LGBM_MODEL_PATH)
-        and os.path.exists(GRAPHSAGE_MLP_MODEL_PATH)
-        and os.path.exists(GRAPHSAGE_RESIDUAL_MODEL_PATH)
-    )
+    model_paths = [
+        BASELINE_MODEL_PATH,
+        GRAPH_MODEL_PATH,
+        GRAPHSAGE_MODEL_PATH,
+        GRAPHSAGE_LGBM_MODEL_PATH,
+        GRAPHSAGE_MLP_MODEL_PATH,
+        GRAPHSAGE_RESIDUAL_MODEL_PATH,
+        NODE2VEC_MODEL_PATH,
+        NODE2VEC_ENHANCED_MODEL_PATH,
+    ]
+    all_cached = all(os.path.exists(p) for p in model_paths)
 
-    if both_cached and not args.retrain:
+    if all_cached and not args.retrain:
         # Fast path: skip the 55 MB CSV load entirely and reuse saved models.
         print("Cached models found - loading (pass --retrain to rebuild).")
-        baseline_art = joblib.load(BASELINE_MODEL_PATH)
-        graph_art = joblib.load(GRAPH_MODEL_PATH)
-        graphsage_art = joblib.load(GRAPHSAGE_MODEL_PATH)
-        graphsage_lgbm_art = joblib.load(GRAPHSAGE_LGBM_MODEL_PATH)
-        graphsage_mlp_art = joblib.load(GRAPHSAGE_MLP_MODEL_PATH)
-        residual_art = joblib.load(GRAPHSAGE_RESIDUAL_MODEL_PATH)
+        artifacts = [joblib.load(p) for p in model_paths]
     else:
         print("Loading data...")
         df, node_metrics = load_data()
@@ -505,6 +511,7 @@ def main():
         df = merge_graph_features(df, node_metrics)
 
         # Ensure GraphSAGE-like embeddings exist (recompute when retraining or missing)
+        G = None
         emb_df = None
         if args.retrain or not os.path.exists(EMBEDDINGS_PATH):
             print("  computing GraphSAGE-like embeddings...")
@@ -519,8 +526,25 @@ def main():
                 G = load_graph()
                 emb_df = compute_graphsage_embeddings(G, node_metrics, emb_dim=EMB_DIM)
 
+        # node2vec embeddings from the SAME training-only graph pickle. Saved to
+        # outputs/ so eda.py's node2vec section auto-activates.
+        n2v_df = None
+        if not args.retrain and os.path.exists(N2V_EMBEDDINGS_PATH):
+            n2v_df = pd.read_csv(N2V_EMBEDDINGS_PATH)
+            print(f"  loaded existing node2vec embeddings -> {N2V_EMBEDDINGS_PATH}")
+        else:
+            if G is None:
+                G = load_graph()
+            n2v_df, _ = compute_node2vec_embeddings(G, N2V_DIM)
+            if n2v_df is not None:
+                n2v_df.to_csv(N2V_EMBEDDINGS_PATH, index=False)
+                print(f"  node2vec embeddings saved -> {N2V_EMBEDDINGS_PATH}")
+        have_n2v = n2v_df is not None  # gensim missing -> skip the node2vec pair
+
         # Merge embeddings into trip rows (src_/dst_ prefixed columns)
         df = merge_embeddings(df, emb_df)
+        if have_n2v:
+            df = merge_embeddings(df, n2v_df)
         df = engineer_features(df)
 
         print("\nSplitting train/test...")
@@ -533,45 +557,60 @@ def main():
         baseline_fill = {f: 0 for f in BASELINE_FEATURES}
         # Embedding fill: zeros for missing embeddings
         emb_fill = {c: 0.0 for c in (SRC_EMB_COLS + DST_EMB_COLS)}
+        n2v_fill = {c: 0.0 for c in (SRC_N2V_COLS + DST_N2V_COLS)}
         graph_fill = {**baseline_fill, **graph_medians, **emb_fill}
 
         print("\nTraining / loading models...")
-        baseline_art = get_model(
-            "baseline", BASELINE_MODEL_PATH,
-            BASELINE_FEATURES, baseline_fill, train, test, args.retrain,
-        )
-        graph_art = get_model(
-            "graph_enhanced", GRAPH_MODEL_PATH,
-            GRAPH_FEATURES, graph_fill, train, test, args.retrain,
-        )
-        graphsage_art = get_model(
-            "graphsage_xgb", GRAPHSAGE_MODEL_PATH,
-            GRAPHSAGE_FEATURES, {**baseline_fill, **emb_fill}, train, test, args.retrain,
-            model_kind="xgb",
-        )
-        graphsage_lgbm_art = get_model(
-            "graphsage_lgbm", GRAPHSAGE_LGBM_MODEL_PATH,
-            GRAPHSAGE_FEATURES, {**baseline_fill, **emb_fill}, train, test, args.retrain,
-            model_kind="lgbm",
-        )
-        graphsage_mlp_art = get_model(
-            "graphsage_mlp", GRAPHSAGE_MLP_MODEL_PATH,
-            GRAPHSAGE_FEATURES, {**baseline_fill, **emb_fill}, train, test, args.retrain,
-            model_kind="mlp",
-        )
-        residual_art = get_model(
-            "graphsage_residual", GRAPHSAGE_RESIDUAL_MODEL_PATH,
-            RESIDUAL_FEATURES, graph_fill, train, test, args.retrain,
-            model_kind="residual",
-        )
+        artifacts = [
+            get_model(
+                "baseline", BASELINE_MODEL_PATH,
+                BASELINE_FEATURES, baseline_fill, train, test, args.retrain,
+            ),
+            get_model(
+                "graph_enhanced", GRAPH_MODEL_PATH,
+                GRAPH_FEATURES, graph_fill, train, test, args.retrain,
+            ),
+            get_model(
+                "graphsage_xgb", GRAPHSAGE_MODEL_PATH,
+                GRAPHSAGE_FEATURES, {**baseline_fill, **emb_fill}, train, test, args.retrain,
+                model_kind="xgb",
+            ),
+            get_model(
+                "graphsage_lgbm", GRAPHSAGE_LGBM_MODEL_PATH,
+                GRAPHSAGE_FEATURES, {**baseline_fill, **emb_fill}, train, test, args.retrain,
+                model_kind="lgbm",
+            ),
+            get_model(
+                "graphsage_mlp", GRAPHSAGE_MLP_MODEL_PATH,
+                GRAPHSAGE_FEATURES, {**baseline_fill, **emb_fill}, train, test, args.retrain,
+                model_kind="mlp",
+            ),
+            get_model(
+                "graphsage_residual", GRAPHSAGE_RESIDUAL_MODEL_PATH,
+                RESIDUAL_FEATURES, graph_fill, train, test, args.retrain,
+                model_kind="residual",
+            ),
+        ]
+        if have_n2v:
+            artifacts.append(get_model(
+                "node2vec_xgb", NODE2VEC_MODEL_PATH,
+                NODE2VEC_FEATURES, {**baseline_fill, **n2v_fill}, train, test, args.retrain,
+                model_kind="xgb",
+            ))
+            artifacts.append(get_model(
+                "node2vec_enhanced", NODE2VEC_ENHANCED_MODEL_PATH,
+                NODE2VEC_ENHANCED_FEATURES, {**baseline_fill, **graph_medians, **n2v_fill},
+                train, test, args.retrain,
+                model_kind="xgb",
+            ))
 
-    report_comparison(baseline_art, graph_art, graphsage_art, graphsage_lgbm_art, graphsage_mlp_art, residual_art)
-    plot_feature_importance(graph_art, IMPORTANCE_PLOT_PATH)
+    report_comparison(artifacts)
+    plot_feature_importance(artifacts[1], IMPORTANCE_PLOT_PATH)  # graph_enhanced
     plot_graphsage_feature_importance()
 
     print("\nDone!\n")
-    return baseline_art, graph_art
+    return artifacts
 
 
 if __name__ == "__main__":
-    baseline_art, graph_art = main()
+    artifacts = main()
